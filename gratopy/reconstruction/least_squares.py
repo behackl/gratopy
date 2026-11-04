@@ -16,6 +16,7 @@ from gratopy.reconstruction._common import (
     prepare_data,
     resolve_operator_norm,
     space_or_euclidean,
+    verify_adjoint,
 )
 from gratopy.reconstruction._vector import axpby, zeros
 
@@ -30,6 +31,8 @@ def landweber(
     operator_norm: float | None = None,
     queue: cl.CommandQueue | None = None,
     callback: Callback | None = None,
+    check_adjoint: bool = True,
+    adjoint_rtol: float | None = None,
 ) -> Any:
     """Landweber iteration (also known as SIRT) [L1951]_.
 
@@ -52,12 +55,19 @@ def landweber(
     :param callback: Called as ``callback(iteration, x)`` after every
         iteration; returning :obj:`True` stops the iteration. ``x`` is the
         current iterate (owned by the solver; copy it to keep it).
+    :param check_adjoint: Verify once that ``operator.T`` is the adjoint in
+        the operator's spaces and raise :class:`ValueError` otherwise (see
+        :meth:`~gratopy.operator.Operator.ensure_adjoint`). Skipped for
+        gratopy's own operators.
+    :param adjoint_rtol: Tolerance of that check; defaults to ``1e-2`` for
+        float32 and ``1e-8`` for float64 data.
     :return: The reconstruction, a device array if a queue is available.
 
     """
     number_iterations = check_iterations(number_iterations)
     w = check_positive(w, "w")
     data = prepare_data(operator, data, queue=queue, x0=x0)
+    verify_adjoint(operator, data, check_adjoint, adjoint_rtol)
     x = initial_guess(operator, data, x0)
     step = w / resolve_operator_norm(operator, operator_norm, data) ** 2
 
@@ -83,6 +93,8 @@ def conjugate_gradients(
     x0: Any | None = None,
     queue: cl.CommandQueue | None = None,
     callback: Callback | None = None,
+    check_adjoint: bool = True,
+    adjoint_rtol: float | None = None,
 ) -> Any:
     """Conjugate gradients for the normal equations (CGLS) [HS1952]_.
 
@@ -107,6 +119,12 @@ def conjugate_gradients(
     :param queue: OpenCL queue; inferred from ``data`` or ``x0`` if omitted.
     :param callback: Called as ``callback(iteration, x)`` after every
         iteration; returning :obj:`True` stops the iteration.
+    :param check_adjoint: Verify once that ``operator.T`` is the adjoint in
+        the operator's spaces and raise :class:`ValueError` otherwise (see
+        :meth:`~gratopy.operator.Operator.ensure_adjoint`). Skipped for
+        gratopy's own operators.
+    :param adjoint_rtol: Tolerance of that check; defaults to ``1e-2`` for
+        float32 and ``1e-8`` for float64 data.
     :return: The reconstruction, a device array if a queue is available.
 
     """
@@ -114,6 +132,7 @@ def conjugate_gradients(
     if epsilon < 0:
         raise ValueError("epsilon must be non-negative")
     data = prepare_data(operator, data, queue=queue, x0=x0)
+    verify_adjoint(operator, data, check_adjoint, adjoint_rtol)
     x = initial_guess(operator, data, x0)
     X = space_or_euclidean(operator.domain, operator.input_shape)
     Y = space_or_euclidean(operator.codomain, operator.output_shape)

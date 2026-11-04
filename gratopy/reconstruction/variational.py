@@ -19,6 +19,7 @@ from gratopy.reconstruction._common import (
     prepare_data,
     resolve_operator_norm,
     solution_shape,
+    verify_adjoint,
 )
 from gratopy.reconstruction._vector import axpby, order_of, zeros
 
@@ -40,6 +41,8 @@ def total_variation(
     operator_norm: float | None = None,
     queue: cl.CommandQueue | None = None,
     callback: Callback | None = None,
+    check_adjoint: bool = True,
+    adjoint_rtol: float | None = None,
 ) -> Any:
     """Total-variation regularized reconstruction via a primal-dual algorithm.
 
@@ -75,6 +78,12 @@ def total_variation(
     :param callback: Called as ``callback(iteration, u)`` after every
         iteration; returning :obj:`True` stops the iteration. ``u`` is owned by
         the solver; copy it to keep it.
+    :param check_adjoint: Verify once that ``operator.T`` is the adjoint in
+        the operator's spaces and raise :class:`ValueError` otherwise (see
+        :meth:`~gratopy.operator.Operator.ensure_adjoint`). Skipped for
+        gratopy's own operators.
+    :param adjoint_rtol: Tolerance of that check; defaults to ``1e-2`` for
+        float32 and ``1e-8`` for float64 data.
     :return: The reconstruction as a device array.
 
     """
@@ -90,6 +99,7 @@ def total_variation(
         )
 
     data = prepare_data(operator, data, queue=queue)
+    verify_adjoint(operator, data, check_adjoint, adjoint_rtol)
     if not isinstance(data, clarray.Array):
         raise ValueError(
             "total_variation runs on the OpenCL device; pass device data or "

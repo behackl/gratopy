@@ -17,6 +17,14 @@ def queue():
     return cl.CommandQueue(cl.create_some_context(interactive=False))
 
 
+def _store(result, output):
+    """Write ``result`` into ``output`` if given (operator output convention)."""
+    if output is None:
+        return result
+    output[...] = result
+    return output
+
+
 class WeightedMatrixOperator(Operator):
     """Matrix operator whose adjoint is taken in weighted spaces."""
 
@@ -36,13 +44,11 @@ class WeightedMatrixOperator(Operator):
         return weights
 
     def apply_to(self, argument, output=None, **kwargs):
-        output[...] = self.matrix @ argument
-        return output
+        return _store(self.matrix @ argument, output)
 
     def apply_adjoint_to(self, argument, output=None, **kwargs):
         weighted = self._weights(self.codomain) * argument
-        output[...] = (self.matrix.T @ weighted) / self._weights(self.domain)
-        return output
+        return _store((self.matrix.T @ weighted) / self._weights(self.domain), output)
 
     def exact_norm(self):
         scaled = (
@@ -186,12 +192,10 @@ def test_operators_without_spaces_use_euclidean_inner_products():
 
     class PlainMatrixOperator(Operator):
         def apply_to(self, argument, output=None, **kwargs):
-            output[...] = matrix @ argument
-            return output
+            return _store(matrix @ argument, output)
 
         def apply_adjoint_to(self, argument, output=None, **kwargs):
-            output[...] = matrix.T @ argument
-            return output
+            return _store(matrix.T @ argument, output)
 
     operator = PlainMatrixOperator(input_shape=(8,), output_shape=(30,))
     x = conjugate_gradients(operator, data, 20)
