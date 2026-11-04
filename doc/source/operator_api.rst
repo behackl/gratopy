@@ -322,12 +322,13 @@ Function spaces
 ---------------
 
 Every operator has a :attr:`~gratopy.operator.base.Operator.domain` and a
-:attr:`~gratopy.operator.base.Operator.codomain`, given as
-:class:`gratopy.operator.space.Space` objects (or ``None`` if unspecified,
-which solvers treat as Euclidean). A space carries the weighted inner product
-in which :attr:`T` is the adjoint. For projection operators, images are
-weighted by the pixel area :math:`\delta_x^2` and sinograms by the detector
-pixel width :math:`\delta_s` and the angle weights:
+:attr:`~gratopy.operator.base.Operator.codomain`, given as immutable
+:class:`gratopy.operator.space.Space` objects or ``None`` if not declared. A
+space carries the weighted inner product with respect to which :attr:`T` is
+the adjoint. For projection operators, the spaces follow from the geometry and
+cannot be assigned: images are weighted by the pixel area :math:`\delta_x^2`,
+sinograms by the detector pixel width :math:`\delta_s` times the angle
+weights.
 
 .. code-block:: python
 
@@ -336,9 +337,28 @@ pixel width :math:`\delta_s` and the angle weights:
 
 Spaces propagate through operator algebra: the adjoint swaps domain and
 codomain, compositions take the domain of their last and the codomain of their
-first operand, and combining operators with different (specified) spaces
-raises a :class:`ValueError`. Custom operators can declare their spaces via
-``domain=`` and ``codomain=`` or by assigning the attributes.
+first operand, and combining operators with different declared spaces raises a
+:class:`ValueError`.
+
+Custom operators that are combined with projection operators should declare
+their spaces, typically by reusing those of the projection operator. An
+operator acting on images, for instance, maps the image space to itself:
+
+.. code-block:: python
+
+    S = MyImageOperator(
+        input_shape=R.input_shape,
+        output_shape=R.input_shape,
+        domain=R.domain,
+        codomain=R.domain,
+    )
+    x = conjugate_gradients(R * S, sino, 50)
+
+Solvers treat operators without any declared spaces (e.g., plain matrix
+operators) as Euclidean. Expressions that combine operators with and without
+declared spaces are rejected with a :class:`ValueError` naming the operator to
+fix, as their adjoint would otherwise silently refer to the wrong inner
+product.
 
 Reconstruction
 --------------

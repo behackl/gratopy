@@ -11,7 +11,6 @@ import pyopencl as cl
 import pyopencl.array as clarray
 
 from gratopy.operator.base import Operator
-from gratopy.operator.space import Space
 from gratopy.reconstruction._vector import order_of, zeros
 
 Callback = Callable[[int, Any], "bool | None"]
@@ -106,14 +105,6 @@ def initial_guess(operator: Operator, data: Any, x0: Any | None) -> Any:
     if isinstance(x0, clarray.Array):
         raise TypeError("x0 is a device array, but data is a NumPy array")
     return np.array(x0, dtype=data.dtype, order=order)
-
-
-def space_or_euclidean(space: Space | None, shape: tuple[int, ...] | None) -> Space:
-    """Return ``space``, falling back to the Euclidean space of ``shape``."""
-    if space is not None:
-        return space
-    assert shape is not None
-    return Space(shape)
 
 
 def check_iterations(number_iterations: Any) -> int:

@@ -38,10 +38,7 @@ class WeightedMatrixOperator(Operator):
         )
 
     def _weights(self, space):
-        weights = np.full(space.shape, space.scale)
-        if space.axis_weights is not None:
-            weights = weights * space.axis_weights
-        return weights
+        return np.broadcast_to(space.weights, space.shape)
 
     def apply_to(self, argument, output=None, **kwargs):
         return _store(self.matrix @ argument, output)
@@ -63,8 +60,8 @@ class WeightedMatrixOperator(Operator):
 def weighted_problem():
     rng = np.random.default_rng(3)
     matrix = rng.standard_normal((40, 10))
-    domain = Space((10,), scale=0.5)
-    codomain = Space((40,), scale=2.0, axis_weights=(0, rng.uniform(0.1, 10.0, 40)))
+    domain = Space((10,), weights=0.5)
+    codomain = Space((40,), weights=2.0 * rng.uniform(0.1, 10.0, 40))
     operator = WeightedMatrixOperator(matrix, domain, codomain)
     data = rng.standard_normal(40)
 
@@ -102,12 +99,14 @@ def radon_problem(queue):
 
 
 # Tolerances against the legacy solvers, which run the same algorithms with
-# differently ordered reductions.
+# differently ordered reductions. CG amplifies these rounding differences over
+# the iterations: in float64, 10 iterations differ by up to ~6e-9 depending on
+# the device (measured on pocl and an AMD GPU).
 LEGACY_TOLERANCES = {
     "float32": {"landweber": 1e-5, "conjugate_gradients": 1e-3, "total_variation": 1e-5},
     "float64": {
         "landweber": 1e-12,
-        "conjugate_gradients": 1e-9,
+        "conjugate_gradients": 1e-7,
         "total_variation": 1e-12,
     },
 }
@@ -333,3 +332,81 @@ def test_total_variation_couples_slices(radon_problem, queue):
     )
     coupled = total_variation(R, stack, 100.0, 50, slice_thickness=1.0, operator_norm=1.0)
     assert relative_difference(coupled, independent) > 1e-3
+
+
+# -- Operators without declared spaces ------------------------------------
+
+
+class DeviceIdentity(Operator):
+    """A custom operator for device arrays, with spaces only if declared."""
+
+    def apply_to(self, argument, output=None, **kwargs):
+        if output is None:
+            return argument.copy()
+        output[...] = argument
+        return output
+
+    apply_adjoint_to = apply_to
+
+
+def test_mixed_space_declarations_are_rejected(radon_problem):
+    R, sinogram = radon_problem
+    S = DeviceIdentity(name="S", input_shape=R.input_shape, output_shape=R.input_shape)
+
+    message = r"S does not declare its domain and codomain, but Radon does"
+    with pytest.raises(ValueError, match=message):
+        conjugate_gradients(R * S, sinogram, 5)
+    with pytest.raises(ValueError, match=message):
+        landweber(R * S, sinogram, 5, operator_norm=1.0)
+    with pytest.raises(ValueError, match=message):
+        total_variation(R * S, sinogram, 1.0, 5, operator_norm=1.0)
+    with pytest.raises(ValueError, match=message):
+        (R * S).norm_estimate(number_iterations=1)
+
+
+def test_declared_custom_operators_compose_with_projections(radon_problem):
+    R, sinogram = radon_problem
+    S = DeviceIdentity(
+        name="S",
+        input_shape=R.input_shape,
+        output_shape=R.input_shape,
+        domain=R.domain,
+        codomain=R.domain,
+    )
+
+    assert (
+        relative_difference(
+            conjugate_gradients(R * S, sinogram, 10), conjugate_gradients(R, sinogram, 10)
+        )
+        < 1e-6
+    )
+    assert (
+        relative_difference(
+            total_variation(R * S, sinogram, 100.0, 20, operator_norm=1.0),
+            total_variation(R, sinogram, 100.0, 20, operator_norm=1.0),
+        )
+        < 1e-6
+    )
+
+
+def test_expressions_without_any_declared_spaces_are_euclidean():
+    rng = np.random.default_rng(6)
+    matrix = rng.standard_normal((30, 8))
+    data = rng.standard_normal(30)
+
+    class Matrix(Operator):
+        def __init__(self, matrix):
+            self.matrix = matrix
+            super().__init__(
+                input_shape=(matrix.shape[1],), output_shape=(matrix.shape[0],)
+            )
+
+        def apply_to(self, argument, output=None, **kwargs):
+            return self.matrix @ argument
+
+        def apply_adjoint_to(self, argument, output=None, **kwargs):
+            return self.matrix.T @ argument
+
+    half = Matrix(np.eye(8) * 0.5)
+    x = conjugate_gradients(Matrix(matrix) * half, data, 20)
+    np.testing.assert_allclose(0.5 * x, np.linalg.lstsq(matrix, data)[0], rtol=1e-8)

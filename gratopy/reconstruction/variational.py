@@ -9,12 +9,12 @@ import numpy as np
 import pyopencl as cl
 import pyopencl.array as clarray
 
-from gratopy.operator.base import Operator
 from gratopy.operator._program_cache import (
     _ProgramBundle,
     acquire_leased,
     owner_leases,
 )
+from gratopy.operator.base import Operator, resolve_spaces
 from gratopy.operator.opencl import OpenCLKernelSpec, _expand_gratopy_template
 from gratopy.reconstruction._common import (
     Callback,
@@ -64,8 +64,10 @@ def total_variation(
     constrained to be nonnegative.
 
     The pixel size :math:`\\delta_x` entering the total variation is taken from
-    ``operator.domain`` (an image space with pixel area :math:`\\delta_x^2`);
-    an unspecified domain means :math:`\\delta_x = 1`.
+    ``operator.domain``, which must have a uniform weight, the pixel area
+    :math:`\\delta_x^2`. Operators without declared spaces use
+    :math:`\\delta_x = 1`; expressions mixing operators with and without
+    declared spaces raise a :class:`ValueError`.
 
     :param operator: The forward operator :math:`A` with a two-dimensional
         input shape.
@@ -106,6 +108,7 @@ def total_variation(
         )
 
     data = prepare_data(operator, data, queue=queue)
+    resolve_spaces(operator)  # reject expressions with ambiguous adjoints
     verify_adjoint(operator, data, check_adjoint, adjoint_rtol)
     if not isinstance(data, clarray.Array):
         raise ValueError(
@@ -163,15 +166,14 @@ def total_variation(
 
 
 def _pixel_size(operator: Operator) -> float:
-    domain = operator.domain
-    if domain is None:
-        return 1.0
-    if domain.axis_weights is not None:
+    # The pixel area is the (uniform) weight of the image domain.
+    pixel_area = resolve_spaces(operator)[0].uniform_weight
+    if pixel_area is None:
         raise ValueError(
-            "total_variation requires an image domain with uniform pixel "
-            f"weights, got {domain}"
+            "total_variation requires an image domain with a uniform weight "
+            f"(the pixel area), got {operator.domain}"
         )
-    return float(np.sqrt(domain.scale))
+    return float(np.sqrt(pixel_area))
 
 
 def _program(owner: Any, context: cl.Context) -> _ProgramBundle:

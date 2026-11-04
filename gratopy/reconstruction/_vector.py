@@ -57,9 +57,7 @@ def axpby(a: float, x: Any, b: float, y: Any, *, owner: Any) -> None:
     x.add_event(event)
 
 
-def _axpby_kernel(
-    owner: Any, context: cl.Context, dtype: np.dtype
-) -> ElementwiseKernel:
+def _axpby_kernel(owner: Any, context: cl.Context, dtype: np.dtype) -> ElementwiseKernel:
     dtype = np.dtype(dtype)
     ctype = {np.dtype(np.float32): "float", np.dtype(np.float64): "double"}[dtype]
 

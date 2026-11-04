@@ -35,8 +35,8 @@ class Matrix(Operator):
 
 def weighted_spaces():
     return (
-        Space((5,), axis_weights=(0, DOMAIN_WEIGHTS)),
-        Space((12,), axis_weights=(0, CODOMAIN_WEIGHTS)),
+        Space((5,), weights=DOMAIN_WEIGHTS),
+        Space((12,), weights=CODOMAIN_WEIGHTS),
     )
 
 
@@ -60,7 +60,7 @@ def test_euclidean_adjoint_in_weighted_spaces_fails(dtype):
 
 def test_uniform_rescaling_of_both_spaces_keeps_the_adjoint():
     # A common constant factor cancels from both sides of the adjoint test.
-    operator = Matrix(domain=Space((5,), scale=0.3), codomain=Space((12,), scale=0.3))
+    operator = Matrix(domain=Space((5,), weights=0.3), codomain=Space((12,), weights=0.3))
     operator.ensure_adjoint(dtype=np.float64)
 
 
@@ -102,15 +102,6 @@ def test_expression_with_inherited_space_is_tested_in_that_space():
     weighted = Matrix((DOMAIN_WEIGHTS, CODOMAIN_WEIGHTS), domain=X, codomain=Y)
     with pytest.raises(ValueError, match="not the adjoint"):
         (weighted + Matrix()).ensure_adjoint(dtype=np.float64)
-
-
-def test_explicitly_set_spaces_are_never_trusted():
-    from gratopy.operator import Radon
-
-    R = Radon(image_domain=8, angles=6)
-    assert R._is_adjoint_trusted()
-    R.domain = Space(R.input_shape)
-    assert not R._is_adjoint_trusted()
 
 
 def test_solvers_and_norm_estimate_check_and_allow_opting_out():

@@ -143,6 +143,9 @@ class Operator:
     #: gratopy's own leaf operators; expression nodes derive it from their
     #: operands.
     _adjoint_trusted: bool = False
+    # Whether ``domain`` and ``codomain`` may be assigned. Expression nodes and
+    # projection operators derive their spaces and disallow assignment.
+    _spaces_assignable = True
 
     def __init__(
         self,
@@ -157,10 +160,8 @@ class Operator:
         self.state = {} if state is None else state
         self.input_shape = input_shape
         self.output_shape = output_shape
-        self._domain: Space | None = None
-        self._codomain: Space | None = None
-        self.domain = domain
-        self.codomain = codomain
+        self._domain = self._checked_space(domain, input_shape, "domain")
+        self._codomain = self._checked_space(codomain, output_shape, "codomain")
         self._adjoint_ref: ReferenceType[AdjointOperator] | None = None
         # (domain, codomain, dtype) combinations in which T passed the test.
         self._adjoint_verified: set[tuple[Any, Any, np.dtype]] = set()
@@ -177,7 +178,10 @@ class Operator:
     def domain(self) -> Space | None:
         """Space of the operator's inputs, or ``None`` if unspecified.
 
-        Solvers treat an unspecified space as Euclidean.
+        The adjoint :attr:`T` refers to the inner products of :attr:`domain`
+        and :attr:`codomain`. Solvers treat an operator without any declared
+        spaces as Euclidean, and reject expressions that combine operators
+        with and without declared spaces.
         """
         if self._domain is not None:
             return self._domain
@@ -185,6 +189,7 @@ class Operator:
 
     @domain.setter
     def domain(self, space: Space | None) -> None:
+        self._ensure_spaces_assignable()
         self._domain = self._checked_space(space, self.input_shape, "domain")
 
     @property
@@ -196,7 +201,14 @@ class Operator:
 
     @codomain.setter
     def codomain(self, space: Space | None) -> None:
+        self._ensure_spaces_assignable()
         self._codomain = self._checked_space(space, self.output_shape, "codomain")
+
+    def _ensure_spaces_assignable(self) -> None:
+        if not self._spaces_assignable:
+            raise AttributeError(
+                f"The spaces of {self!r} are derived and cannot be assigned."
+            )
 
     @staticmethod
     def _checked_space(
@@ -229,9 +241,7 @@ class Operator:
         Explicitly set spaces are never trusted: the setters change the inner
         products but not what :attr:`T` computes.
         """
-        return (
-            self._adjoint_trusted and self._domain is None and self._codomain is None
-        )
+        return self._adjoint_trusted and self._domain is None and self._codomain is None
 
     def _adjoint_key(self, dtype: npt.DTypeLike) -> tuple[Any, Any, np.dtype]:
         return (self.domain, self.codomain, np.dtype(dtype))
@@ -478,6 +488,8 @@ class Operator:
                 "operator.input_shape or pass input_shape explicitly."
             )
 
+        if input_shape == self.input_shape:
+            resolve_spaces(self)  # reject expressions with ambiguous adjoints
         adjoint = self.T
         if check_adjoint:
             self.ensure_adjoint(
@@ -494,7 +506,10 @@ class Operator:
 
         # .T is self-adjoint with respect to the domain's inner product, so
         # normalizing in that norm makes every iterate a lower bound of the norm.
-        space = self.domain if self.domain is not None else Space(tuple(input_shape))
+        if input_shape == self.input_shape:
+            space = resolve_spaces(self)[0]
+        else:
+            space = Space(tuple(input_shape))
         x = np.asarray(rng.standard_normal(input_shape), dtype=dtype)
         x_norm = space.norm(x)
         if x_norm == 0:
@@ -597,6 +612,8 @@ class Operator:
 class AdjointOperator(Operator):
     """Adjoint view of an underlying operator."""
 
+    _spaces_assignable = False
+
     def __init__(self, operand: Operator):
         super().__init__(
             name=f"{operand.name}.T",
@@ -652,6 +669,8 @@ class AdjointOperator(Operator):
 
 class ScaledOperator(Operator):
     """An operator multiplied by a scalar."""
+
+    _spaces_assignable = False
 
     def __init__(self, scalar: Numeric, operand: Operator):
         super().__init__(
@@ -748,6 +767,8 @@ class ScaledOperator(Operator):
 class SumOperator(Operator):
     """A sum of operators with compatible input and output shapes."""
 
+    _spaces_assignable = False
+
     def __init__(self, operands: tuple[Operator, ...]):
         input_shape, output_shape = _compute_sum_shapes(operands)
         _common_space([op.domain for op in operands], "Domain in sum")
@@ -834,6 +855,8 @@ class SumOperator(Operator):
 
 class CompositionOperator(Operator):
     """A composition ``A*B`` representing ``A(B(x))``."""
+
+    _spaces_assignable = False
 
     def __init__(self, operands: tuple[Operator, ...]):
         input_shape, output_shape = _compute_product_shapes(operands)
@@ -924,6 +947,7 @@ class _IdentityOperator(Operator):
 
     # Self-adjoint with respect to every inner product.
     _adjoint_trusted = True
+    _spaces_assignable = False
 
     @property
     def T(self) -> Operator:
@@ -950,6 +974,7 @@ class _ZeroOperator(Operator):
 
     # Self-adjoint with respect to every inner product.
     _adjoint_trusted = True
+    _spaces_assignable = False
 
     @property
     def T(self) -> Operator:
@@ -983,3 +1008,56 @@ class _ZeroOperator(Operator):
 
 IDENTITY = _IdentityOperator(name="[Id]")
 ZERO = _ZeroOperator(name="[0]")
+
+
+def _leaf_operators(operator: Operator) -> list[Operator]:
+    """Return the leaf operators of an expression, without IDENTITY and ZERO."""
+    if isinstance(operator, (AdjointOperator, ScaledOperator)):
+        return _leaf_operators(operator.operand)
+    if isinstance(operator, (SumOperator, CompositionOperator)):
+        return [leaf for op in operator.operands for leaf in _leaf_operators(op)]
+    if isinstance(operator, (_IdentityOperator, _ZeroOperator)):
+        return []
+    return [operator]
+
+
+def resolve_spaces(operator: Operator) -> tuple[Space, Space]:
+    """Return the domain and codomain in which ``operator.T`` is the adjoint.
+
+    Operators without any declared spaces are Euclidean. Expressions that
+    combine operators with and without declared spaces are rejected, as the
+    inner products their adjoint refers to are then ambiguous.
+
+    :raises ValueError: If the declarations of the leaf operators are mixed,
+        or if the operator has no input or output shape.
+    """
+    leaves = _leaf_operators(operator)
+    # Partition by identity: Operator.__eq__ is structural, so distinct leaves
+    # (e.g. two instances of one custom class) may compare equal.
+    is_declared = [
+        leaf.domain is not None and leaf.codomain is not None for leaf in leaves
+    ]
+    if not all(is_declared) and any(is_declared):
+        undeclared = [leaf for leaf, ok in zip(leaves, is_declared) if not ok]
+        names = ", ".join(sorted({repr(leaf) for leaf in undeclared}))
+        declared = next(leaf for leaf, ok in zip(leaves, is_declared) if ok)
+        raise ValueError(
+            f"Cannot determine the inner products of {operator!r}: {names} "
+            f"does not declare its domain and codomain, but {declared!r} does. "
+            "Declare the spaces of custom operators that are combined with "
+            "projection operators, e.g. "
+            "Operator(..., domain=R.domain, codomain=R.domain)."
+        )
+
+    domain, codomain = operator.domain, operator.codomain
+    if domain is not None and codomain is not None:
+        return domain, codomain
+    if operator.input_shape is None or operator.output_shape is None:
+        raise ValueError(
+            f"Cannot determine the spaces of {operator!r}: its input and "
+            "output shapes are unknown."
+        )
+    return (
+        domain or Space(tuple(operator.input_shape)),
+        codomain or Space(tuple(operator.output_shape)),
+    )

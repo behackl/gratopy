@@ -71,6 +71,8 @@ class _ProjectionOperator(_OpenCLOperator):
     """Shared runtime plumbing for concrete projection geometries."""
 
     _operator_name = "Projection"
+    # The spaces follow from the geometry, see _projection_spaces.
+    _spaces_assignable = False
     _kernel_filename = ""
     _kernel_base_name = ""
     _device_array_specs: tuple[tuple[str, str], ...] = ()
@@ -135,7 +137,8 @@ class _ProjectionOperator(_OpenCLOperator):
         """Return the image and sinogram spaces the adjoint refers to.
 
         Images carry the pixel area :math:`\\delta_x^2`, sinograms the detector
-        pixel width :math:`\\delta_s` and the angle weights.
+        pixel width :math:`\\delta_s` times the angle weights. The weights are
+        computed from the geometry, so they always match the backprojection.
         """
         if self._spaces is None:
             image_extent = self.image_domain.extent
@@ -145,11 +148,10 @@ class _ProjectionOperator(_OpenCLOperator):
             delta_x = float(image_extent) / max(self.image_domain.size)
             delta_s = float(detector_extent) / self.detectors.number
             self._spaces = (
-                Space(self.image_domain.size, scale=delta_x**2),
+                Space(self.image_domain.size, weights=delta_x**2),
                 Space(
                     (self.detectors.number, len(self.angles)),
-                    scale=delta_s,
-                    axis_weights=(1, self.angles.weights),
+                    weights=delta_s * self.angles.weights,
                 ),
             )
         return self._spaces

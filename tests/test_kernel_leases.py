@@ -70,10 +70,10 @@ def test_invalidation_rebuilds_the_programs(queue_and_operator):
 def test_weighted_dot_kernel_is_released_with_the_space(device):
     def use_space():
         queue = cl.CommandQueue(cl.Context([device]))
-        X = Space((4, 3), axis_weights=(1, [1.0, 2.0, 3.0]))
+        X = Space((4, 3), weights=[1.0, 2.0, 3.0])
         x = clarray.to_device(queue, np.ones((4, 3), np.float32))
         assert X.inner(x, x) == pytest.approx(24.0)
-        assert owner_leases(X)
+        assert X._kernel_leases
         return queue.context.int_ptr
 
     handle = use_space()
@@ -87,7 +87,7 @@ def test_leases_are_not_copied_or_pickled(queue_and_operator):
     assert owner_leases(R)
     for copied in [copy.deepcopy(R), pickle.loads(pickle.dumps(R))]:
         assert "_kernel_leases" not in copied.__dict__
-        assert "_kernel_leases" not in copied.codomain.__dict__
+        assert copied.codomain._kernel_leases == {}
 
 
 @pytest.fixture

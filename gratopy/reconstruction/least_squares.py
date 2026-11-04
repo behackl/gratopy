@@ -6,7 +6,7 @@ from typing import Any
 
 import pyopencl as cl
 
-from gratopy.operator.base import Operator
+from gratopy.operator.base import Operator, resolve_spaces
 from gratopy.reconstruction._common import (
     Callback,
     check_iterations,
@@ -15,7 +15,6 @@ from gratopy.reconstruction._common import (
     notify,
     prepare_data,
     resolve_operator_norm,
-    space_or_euclidean,
     verify_adjoint,
 )
 from gratopy.reconstruction._vector import axpby, zeros
@@ -67,6 +66,7 @@ def landweber(
     number_iterations = check_iterations(number_iterations)
     w = check_positive(w, "w")
     data = prepare_data(operator, data, queue=queue, x0=x0)
+    resolve_spaces(operator)  # reject expressions with ambiguous adjoints
     verify_adjoint(operator, data, check_adjoint, adjoint_rtol)
     x = initial_guess(operator, data, x0)
     step = w / resolve_operator_norm(operator, operator_norm, data) ** 2
@@ -100,8 +100,9 @@ def conjugate_gradients(
 
     Approximates a solution of :math:`\\min_x \\|Ax - f\\|^2`. Inner products
     are taken in ``operator.domain`` and ``operator.codomain``, i.e., in the
-    same weighted spaces in which ``operator.T`` is the adjoint; unspecified
-    spaces are treated as Euclidean.
+    same weighted spaces in which ``operator.T`` is the adjoint. Operators
+    without declared spaces are Euclidean; expressions mixing operators with
+    and without declared spaces raise a :class:`ValueError`.
 
     Starting from ``x0``, the iteration converges to the least-squares
     solution closest to ``x0`` (the minimum-norm solution for ``x0 = 0``).
@@ -132,10 +133,9 @@ def conjugate_gradients(
     if epsilon < 0:
         raise ValueError("epsilon must be non-negative")
     data = prepare_data(operator, data, queue=queue, x0=x0)
+    X, Y = resolve_spaces(operator)
     verify_adjoint(operator, data, check_adjoint, adjoint_rtol)
     x = initial_guess(operator, data, x0)
-    X = space_or_euclidean(operator.domain, operator.input_shape)
-    Y = space_or_euclidean(operator.codomain, operator.output_shape)
 
     adjoint = operator.T
     residual = operator.apply_to(x, output=zeros(data.shape, like=data))

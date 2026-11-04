@@ -1,9 +1,9 @@
 """Function spaces of operators.
 
 A :class:`Space` describes the Hilbert space an operator acts on or maps into:
-a discretized :math:`L^2` space with a diagonal weighting of its inner product.
+a discretized :math:`L^2` space whose inner product carries positive weights.
 Projection operators use weighted spaces (pixel area for images, detector
-pixel width and angle weights for sinograms); their adjoints :attr:`T` are
+pixel width times angle weights for sinograms); their adjoints :attr:`T` are
 adjoint with respect to exactly these inner products.
 
 Arrays may carry trailing dimensions beyond :attr:`Space.shape` (e.g., a stack
@@ -14,7 +14,7 @@ the slicewise application of operators.
 from __future__ import annotations
 
 from math import prod
-from typing import Any
+from typing import Any, Literal, NoReturn
 
 import numpy as np
 import numpy.typing as npt
@@ -22,101 +22,107 @@ import pyopencl as cl
 import pyopencl.array as clarray
 from pyopencl.reduction import ReductionKernel
 
-from gratopy.operator._program_cache import acquire_leased, owner_leases
+from gratopy.operator._program_cache import (
+    _ProgramBundle,
+    _ProgramLeaseKey,
+    acquire_leased,
+)
 
 
 class Space:
-    """Discretized :math:`L^2` space with a diagonal inner-product weighting.
+    """Discretized :math:`L^2` space with a weighted inner product.
 
-    The inner product is
-
-    .. math::
-
-        \\langle x, y \\rangle = \\mathrm{scale} \\sum_i w_i x_i y_i,
-
-    where :math:`w_i` is the entry of ``axis_weights`` belonging to the index
-    of :math:`i` along the weighted axis (or 1 without axis weights).
+    The inner product is :math:`\\langle x, y \\rangle = \\sum_i w_i x_i y_i`
+    with positive weights :math:`w`. Spaces are immutable.
 
     **Parameters**
 
     ``shape``:
         Base shape of the elements of the space.
-    ``scale``:
-        Positive constant factor of the inner product, e.g., the pixel area.
-    ``axis_weights``:
-        Optional pair ``(axis, weights)`` of an axis of ``shape`` and positive
-        weights along it, e.g., the angle weights of a sinogram.
+    ``weights``:
+        Positive weights, as a scalar or an array broadcastable to ``shape``
+        (NumPy broadcasting rules). Defaults to 1, the Euclidean space.
 
-    **Example**
+    **Examples**
+
+    Images with pixel area 0.25, and sinograms with detector pixel width 0.1
+    and one weight per angle (the last axis):
 
     >>> import numpy as np
     >>> from gratopy.operator import Space
-    >>> X = Space((2, 3), scale=0.5, axis_weights=(1, [1.0, 2.0, 1.0]))
-    >>> X.inner(np.ones((2, 3)), np.ones((2, 3)))
-    4.0
+    >>> images = Space((64, 64), weights=0.25)
+    >>> sinograms = Space((91, 3), weights=0.1 * np.array([1.0, 2.0, 1.0]))
+    >>> sinograms.inner(np.ones((91, 3)), np.ones((91, 3)))
+    36.4
     """
 
-    def __init__(
-        self,
-        shape: tuple[int, ...],
-        scale: float = 1.0,
-        axis_weights: tuple[int, npt.ArrayLike] | None = None,
-    ) -> None:
-        self.shape = tuple(int(n) for n in shape)
-        self.scale = float(scale)
-        if not np.isfinite(self.scale) or self.scale <= 0:
-            raise ValueError("scale must be positive and finite")
+    __slots__ = (
+        "shape",
+        "_weights",
+        "_uniform_weight",
+        "_device_weights",
+        "_kernel_leases",
+    )
 
-        self.weight_axis: int | None = None
-        self.axis_weights: np.ndarray | None = None
-        if axis_weights is not None:
-            axis, weights = axis_weights
-            if not 0 <= axis < len(self.shape):
-                raise ValueError(
-                    f"weight axis {axis} out of range for shape {self.shape}"
-                )
-            weights = np.array(weights, dtype=np.float64)
-            if weights.shape != (self.shape[axis],):
-                raise ValueError(
-                    f"axis weights must have shape ({self.shape[axis]},), "
-                    f"got {weights.shape}"
-                )
-            if not np.all(np.isfinite(weights)) or np.any(weights <= 0):
-                raise ValueError("axis weights must be positive and finite")
-            weights.flags.writeable = False
-            self.weight_axis = int(axis)
-            self.axis_weights = weights
+    shape: tuple[int, ...]
+    _weights: np.ndarray
+    _uniform_weight: float | None
+    _device_weights: dict[tuple[cl.Context, np.dtype, str], clarray.Array]
+    _kernel_leases: dict[_ProgramLeaseKey, _ProgramBundle]
 
-        self._device_weights: dict[tuple[cl.Context, np.dtype], clarray.Array] = {}
+    def __init__(self, shape: tuple[int, ...], weights: npt.ArrayLike = 1.0) -> None:
+        shape = tuple(int(n) for n in shape)
+        canonical = _canonical_weights(weights, shape)
+        uniform = float(canonical.flat[0]) if canonical.size == 1 else None
+        object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "_weights", canonical)
+        object.__setattr__(self, "_uniform_weight", uniform)
+        object.__setattr__(self, "_device_weights", {})
+        object.__setattr__(self, "_kernel_leases", {})
+
+    @property
+    def weights(self) -> np.ndarray:
+        """Read-only weights, broadcastable to :attr:`shape`.
+
+        The array has one axis per axis of :attr:`shape`; axes along which
+        the weights are constant have length 1.
+        """
+        return self._weights
+
+    @property
+    def uniform_weight(self) -> float | None:
+        """The common weight if all weights are equal, otherwise ``None``."""
+        return self._uniform_weight
+
+    def __setattr__(self, name: str, value: Any) -> NoReturn:
+        raise AttributeError("Space objects are immutable")
+
+    def __delattr__(self, name: str) -> NoReturn:
+        raise AttributeError("Space objects are immutable")
 
     def __getstate__(self) -> dict[str, Any]:
-        """Return pickle/deepcopy state without device buffers."""
-        state = self.__dict__.copy()
-        state["_device_weights"] = {}
-        state.pop("_kernel_leases", None)
-        return state
+        """Return pickle/deepcopy state without device buffers and leases."""
+        return {"shape": self.shape, "weights": self._weights}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        Space.__init__(self, state["shape"], state["weights"])
 
     def __eq__(self, other: Any) -> bool:
         if not isinstance(other, Space):
             return NotImplemented
-        if (self.shape, self.scale, self.weight_axis) != (
-            other.shape,
-            other.scale,
-            other.weight_axis,
-        ):
-            return False
-        if self.axis_weights is None or other.axis_weights is None:
-            return self.axis_weights is other.axis_weights
-        return bool(np.array_equal(self.axis_weights, other.axis_weights))
+        return self.shape == other.shape and bool(
+            np.array_equal(self._weights, other._weights)
+        )
 
     def __hash__(self) -> int:
-        return hash((self.shape, self.scale, self.weight_axis))
+        return hash((self.shape, self._weights.shape, self._weights.tobytes()))
 
     def __repr__(self) -> str:
-        weights = ""
-        if self.weight_axis is not None:
-            weights = f", axis_weights=(axis {self.weight_axis}, ...)"
-        return f"Space(shape={self.shape}, scale={self.scale!r}{weights})"
+        if self._uniform_weight is not None:
+            weights = repr(self._uniform_weight)
+        else:
+            weights = f"<array of shape {self._weights.shape}>"
+        return f"Space(shape={self.shape}, weights={weights})"
 
     def inner(self, x: Any, y: Any) -> float:
         """Return the inner product of ``x`` and ``y``.
@@ -127,17 +133,14 @@ class Space:
         """
         self._validate(x, y)
         if isinstance(x, clarray.Array):
-            return self.scale * self._device_inner(x, y)
+            return self._device_inner(x, y)
 
-        x = np.asarray(x)
-        y = np.asarray(y)
-        product = x * y
-        if self.axis_weights is not None:
-            assert self.weight_axis is not None
-            broadcast_shape = [1] * x.ndim
-            broadcast_shape[self.weight_axis] = len(self.axis_weights)
-            product = product * self.axis_weights.reshape(broadcast_shape)
-        return self.scale * float(np.real(product.sum()))
+        product = np.asarray(x) * np.asarray(y)
+        if self._uniform_weight is not None:
+            return self._uniform_weight * float(np.real(product.sum()))
+        extra_dims = product.ndim - len(self.shape)
+        weights = self._weights.reshape(self._weights.shape + (1,) * extra_dims)
+        return float(np.real((product * weights).sum()))
 
     def norm(self, x: Any) -> float:
         """Return the norm of ``x`` induced by :meth:`inner`."""
@@ -159,6 +162,7 @@ class Space:
     def _device_inner(self, x: clarray.Array, y: clarray.Array) -> float:
         if x.dtype != y.dtype:
             raise ValueError(f"dtype mismatch: {x.dtype} and {y.dtype}")
+        order: Literal["C", "F"]
         if x.flags.c_contiguous and y.flags.c_contiguous:
             order = "C"
         elif x.flags.f_contiguous and y.flags.f_contiguous:
@@ -166,40 +170,49 @@ class Space:
         else:
             raise ValueError("Both arrays must be contiguous with the same order.")
 
-        if self.axis_weights is None:
-            return float(np.real(clarray.vdot(x, y).get()))
+        if self._uniform_weight is not None:
+            return self._uniform_weight * float(np.real(clarray.vdot(x, y).get()))
 
-        assert self.weight_axis is not None
-        axis = self.weight_axis
-        if order == "F":
-            stride = prod(x.shape[:axis])
-        else:
-            stride = prod(x.shape[axis + 1 :])
         queue = x.queue
         assert queue is not None
+        weights, stride, count = self._device_weight_layout(queue, x, order)
         kernel = self._weighted_dot_kernel(queue.context, x.dtype)
-        weights = self._weights_on_device(queue, x.dtype)
         result = kernel(
             x,
             y,
             weights,
             np.int64(stride),
-            np.int64(len(self.axis_weights)),
+            np.int64(count),
             queue=queue,
             return_event=False,
         )
         return float(result.get())
 
-    def _weights_on_device(
-        self, queue: cl.CommandQueue, dtype: np.dtype
-    ) -> clarray.Array:
-        assert self.axis_weights is not None
-        key = (queue.context, np.dtype(dtype))
+    def _device_weight_layout(
+        self, queue: cl.CommandQueue, x: clarray.Array, order: Literal["C", "F"]
+    ) -> tuple[clarray.Array, int, int]:
+        """Return device weights ``w``, ``stride`` and ``count`` such that the
+        weight of flat element ``i`` of ``x`` is ``w[(i / stride) % count]``.
+        """
+        varying = [axis for axis, n in enumerate(self._weights.shape) if n > 1]
+        if len(varying) == 1:
+            # Weights along a single axis: upload only that vector.
+            (axis,) = varying
+            host = self._weights.ravel()
+            faster_axes = x.shape[:axis] if order == "F" else x.shape[axis + 1 :]
+            stride, count, layout = prod(faster_axes), self.shape[axis], "axis"
+        else:
+            host = np.broadcast_to(self._weights, self.shape).ravel(order=order)
+            extra = x.shape[len(self.shape) :]
+            stride = 1 if order == "F" else prod(extra)
+            count, layout = prod(self.shape), order
+
+        key = (queue.context, x.dtype, layout)
         weights = self._device_weights.get(key)
         if weights is None:
-            weights = clarray.to_device(queue, self.axis_weights.astype(dtype))
+            weights = clarray.to_device(queue, host.astype(x.dtype))
             self._device_weights[key] = weights
-        return weights
+        return weights, stride, count
 
     def _weighted_dot_kernel(
         self, context: cl.Context, dtype: np.dtype
@@ -227,9 +240,34 @@ class Space:
             )
 
         bundle = acquire_leased(
-            owner_leases(self),
+            self._kernel_leases,
             ("weighted_dot", context, dtype),
             (context, f"gratopy_weighted_dot:{dtype.name}", None),
             build,
         )
         return bundle.program
+
+
+def _canonical_weights(weights: npt.ArrayLike, shape: tuple[int, ...]) -> np.ndarray:
+    """Validate weights and return them with one axis per axis of ``shape``,
+    collapsing axes along which they are constant to length 1.
+    """
+    array = np.array(weights, dtype=np.float64)
+    try:
+        broadcast_shape = np.broadcast_shapes(array.shape, shape)
+    except ValueError:
+        broadcast_shape = None
+    if broadcast_shape != shape:
+        raise ValueError(
+            f"weights of shape {array.shape} are not broadcastable to {shape}"
+        )
+    if not np.all(np.isfinite(array)) or np.any(array <= 0):
+        raise ValueError("weights must be positive and finite")
+
+    array = array.reshape((1,) * (len(shape) - array.ndim) + array.shape)
+    for axis in range(array.ndim):
+        if array.shape[axis] > 1 and np.all(array == array.take([0], axis=axis)):
+            array = array.take([0], axis=axis)
+    array = np.ascontiguousarray(array)
+    array.flags.writeable = False
+    return array

@@ -7,6 +7,7 @@ import pyopencl as cl
 import pyopencl.array as clarray
 import pytest
 
+from gratopy.operator.base import resolve_spaces
 from gratopy.operator import (
     Fanbeam,
     Operator,
@@ -16,7 +17,7 @@ from gratopy.operator import (
     Space,
     StripDrivenRadon,
 )
-from gratopy.utilities import Detectors, ImageDomain
+from gratopy.utilities import Angles, Detectors, ImageDomain
 
 
 @pytest.fixture(scope="module")
@@ -49,38 +50,72 @@ PROJECTION_OPERATORS = [
 ]
 
 
-def test_space_validates_arguments():
-    with pytest.raises(ValueError, match="scale"):
-        Space((3,), scale=0.0)
-    with pytest.raises(ValueError, match="out of range"):
-        Space((3,), axis_weights=(1, [1.0]))
-    with pytest.raises(ValueError, match="shape"):
-        Space((3, 2), axis_weights=(0, [1.0, 2.0]))
+def test_space_validates_weights():
     with pytest.raises(ValueError, match="positive"):
-        Space((2,), axis_weights=(0, [1.0, -1.0]))
+        Space((3,), weights=0.0)
+    with pytest.raises(ValueError, match="positive"):
+        Space((2,), weights=[1.0, -1.0])
+    with pytest.raises(ValueError, match="positive"):
+        Space((2,), weights=[1.0, np.inf])
+    with pytest.raises(ValueError, match="not broadcastable"):
+        Space((3, 2), weights=[1.0, 2.0, 3.0])  # broadcasting aligns trailing axes
+    with pytest.raises(ValueError, match="not broadcastable"):
+        Space((3,), weights=np.ones((2, 3)))  # would enlarge the shape
+
+
+def test_weights_are_stored_compactly():
+    assert Space((3, 4)).weights.shape == (1, 1)
+    assert Space((3, 4), weights=[1.0, 2.0, 3.0, 4.0]).weights.shape == (1, 4)
+    assert Space((3, 4), weights=np.full((3, 4), 2.0)).weights.shape == (1, 1)
+    column = np.arange(1.0, 4.0)[:, None]
+    assert Space((3, 4), weights=column * np.ones(4)).weights.shape == (3, 1)
+
+
+def test_uniform_weight():
+    assert Space((3, 4)).uniform_weight == 1.0
+    assert Space((3, 4), weights=np.full((3, 4), 2.0)).uniform_weight == 2.0
+    assert Space((3, 4), weights=[1.0, 2.0, 1.0, 1.0]).uniform_weight is None
 
 
 def test_space_equality():
-    weights = (1, [1.0, 2.0])
-    assert Space((3, 2), 0.5, weights) == Space((3, 2), 0.5, weights)
-    assert hash(Space((3, 2), 0.5, weights)) == hash(Space((3, 2), 0.5, weights))
-    assert Space((3, 2), 0.5, weights) != Space((3, 2), 0.5, (1, [1.0, 3.0]))
-    assert Space((3, 2), 0.5, weights) != Space((3, 2), 0.5)
+    weights = [1.0, 2.0]
+    assert Space((3, 2), weights) == Space((3, 2), np.array([weights] * 3))
+    assert hash(Space((3, 2), weights)) == hash(Space((3, 2), np.array([weights] * 3)))
+    assert Space((3, 2), weights) != Space((3, 2), [1.0, 3.0])
+    assert Space((3, 2), 0.5) == Space((3, 2), np.full((3, 2), 0.5))
+    assert Space((3, 2), 0.5) != Space((3, 2))
     assert Space((3, 2)) != Space((2, 3))
 
 
-def test_numpy_inner_product_applies_scale_and_axis_weights():
+def test_space_is_immutable():
+    space = Space((3, 2), weights=[1.0, 2.0])
+    with pytest.raises(AttributeError, match="immutable"):
+        space.shape = (2, 3)
+    with pytest.raises(AttributeError, match="immutable"):
+        space.weights = 1.0
+    with pytest.raises(ValueError, match="read-only"):
+        space.weights[0, 0] = 5.0
+
+
+@pytest.mark.parametrize(
+    "weights",
+    [
+        0.5,
+        [1.0, 2.0, 3.0, 4.0],
+        np.arange(1.0, 4.0)[:, None],
+        np.arange(1.0, 13.0).reshape(3, 4),
+    ],
+    ids=["scalar", "last-axis", "first-axis", "full"],
+)
+def test_numpy_inner_product_applies_weights(weights):
     rng = np.random.default_rng(0)
     x = rng.standard_normal((3, 4, 2))
     y = rng.standard_normal((3, 4, 2))
-    weights = np.array([1.0, 2.0, 3.0, 4.0])
-    space = Space((3, 4), scale=0.5, axis_weights=(1, weights))
+    space = Space((3, 4), weights=weights)
 
-    expected = 0.5 * np.sum(x * y * weights[None, :, None])
-    assert space.inner(x, y) == pytest.approx(expected)
-    assert space.norm(x) == pytest.approx(
-        np.sqrt(0.5 * np.sum(x * x * weights[None, :, None]))
-    )
+    full = np.broadcast_to(np.asarray(weights), (3, 4))[..., None]
+    assert space.inner(x, y) == pytest.approx(np.sum(full * x * y))
+    assert space.norm(x) == pytest.approx(np.sqrt(np.sum(full * x * x)))
 
 
 def test_inner_product_rejects_wrong_shapes():
@@ -93,10 +128,10 @@ def test_inner_product_rejects_wrong_shapes():
 
 @pytest.mark.parametrize("dtype, rel", [(np.float32, 1e-5), (np.float64, 1e-12)])
 @pytest.mark.parametrize("order", ["C", "F"])
-@pytest.mark.parametrize("weight_axis", [0, 1])
+@pytest.mark.parametrize("weights", ["scalar", "axis-0", "axis-1", "full"])
 @pytest.mark.parametrize("extra_dims", [(), (3,)])
 def test_device_inner_product_matches_numpy(
-    queue, dtype, rel, order, weight_axis, extra_dims
+    queue, dtype, rel, order, weights, extra_dims
 ):
     if dtype == np.float64 and not queue.device.double_fp_config:
         pytest.skip("OpenCL device does not support double precision")
@@ -104,8 +139,13 @@ def test_device_inner_product_matches_numpy(
     shape = (5, 7)
     x = np.require(rng.standard_normal(shape + extra_dims), dtype, order)
     y = np.require(rng.standard_normal(shape + extra_dims), dtype, order)
-    weights = rng.uniform(0.5, 2.0, shape[weight_axis])
-    space = Space(shape, scale=0.3, axis_weights=(weight_axis, weights))
+    weight_values = {
+        "scalar": 0.3,
+        "axis-0": rng.uniform(0.5, 2.0, (5, 1)),
+        "axis-1": rng.uniform(0.5, 2.0, 7),
+        "full": rng.uniform(0.5, 2.0, shape),
+    }[weights]
+    space = Space(shape, weights=weight_values)
 
     device_value = space.inner(clarray.to_device(queue, x), clarray.to_device(queue, y))
     assert device_value == pytest.approx(space.inner(x, y), rel=rel)
@@ -124,10 +164,18 @@ def test_projection_spaces_carry_physical_weights():
     delta_x = 2.0 / 24
     delta_s = float(R.detectors.extent) / R.detectors.number
 
-    assert R.domain == Space((24, 20), scale=delta_x**2)
-    assert R.codomain == Space(
-        R.output_shape, scale=delta_s, axis_weights=(1, R.angles.weights)
-    )
+    assert R.domain == Space((24, 20), weights=delta_x**2)
+    assert R.codomain == Space(R.output_shape, weights=delta_s * R.angles.weights)
+
+
+def test_projection_spaces_are_read_only():
+    R = make_radon()
+    with pytest.raises(AttributeError, match="derived"):
+        R.codomain = Space(R.output_shape)
+    with pytest.raises(AttributeError, match="derived"):
+        R.T.domain = Space(R.output_shape)
+    with pytest.raises(AttributeError, match="derived"):
+        (2 * R).domain = Space(R.input_shape)
 
 
 @pytest.mark.parametrize("make_operator", PROJECTION_OPERATORS)
@@ -168,8 +216,8 @@ def test_custom_operator_spaces():
     operator = Operator(input_shape=(3,), output_shape=(2,))
     assert operator.domain is None and operator.codomain is None
 
-    operator.domain = Space((3,), scale=2.0)
-    assert operator.T.codomain == Space((3,), scale=2.0)
+    operator.domain = Space((3,), weights=2.0)
+    assert operator.T.codomain == Space((3,), weights=2.0)
     with pytest.raises(ValueError, match="does not match the operator shape"):
         operator.codomain = Space((3,))
     with pytest.raises(TypeError, match="must be a Space"):
@@ -177,7 +225,12 @@ def test_custom_operator_spaces():
 
 
 def test_spaces_survive_copies_without_device_buffers(queue):
-    R = make_radon()
+    # Non-uniform angle weights, so that the sinogram space needs device weights.
+    R = Radon(
+        image_domain=ImageDomain(size=(24, 20), extent=2.0),
+        angles=Angles.from_list([0.1, 0.4, 1.2, 2.0, 2.9], half_circle=True),
+    )
+    assert R.codomain.uniform_weight is None
     sinogram = clarray.to_device(queue, np.ones(R.output_shape, np.float32))
     R.codomain.inner(sinogram, sinogram)
     assert R.codomain._device_weights
@@ -203,8 +256,8 @@ def test_norm_estimate_is_a_monotone_lower_bound_in_weighted_spaces():
     operator = WeightedMatrix(
         input_shape=(30,),
         output_shape=(40,),
-        domain=Space((30,), axis_weights=(0, domain_weights)),
-        codomain=Space((40,), axis_weights=(0, codomain_weights)),
+        domain=Space((30,), weights=domain_weights),
+        codomain=Space((40,), weights=codomain_weights),
     )
     exact = np.linalg.norm(
         np.sqrt(codomain_weights)[:, None] * matrix / np.sqrt(domain_weights)[None, :],
@@ -223,3 +276,13 @@ def test_norm_estimate_is_a_monotone_lower_bound_in_weighted_spaces():
         number_iterations=300, dtype=np.float64, rng=np.random.default_rng(0)
     )
     assert converged == pytest.approx(exact, rel=1e-8)
+
+
+def test_mixed_declarations_are_detected_for_structurally_equal_leaves():
+    # Operator equality ignores spaces, so these two leaves compare equal.
+    declared = Operator(input_shape=(3,), output_shape=(3,), domain=Space((3,), 2.0))
+    declared.codomain = Space((3,), 2.0)
+    undeclared = Operator(input_shape=(3,), output_shape=(3,))
+    assert declared == undeclared
+    with pytest.raises(ValueError, match="does not declare its domain and codomain"):
+        resolve_spaces(declared + undeclared)
