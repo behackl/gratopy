@@ -76,9 +76,9 @@ def landweber(
     gradient = zeros(x.shape, like=x)
     for iteration in range(1, number_iterations + 1):
         residual = operator.apply_to(x, output=residual)
-        axpby(1.0, residual, -1.0, data)  # residual = Ax - f
+        axpby(1.0, residual, -1.0, data, owner=operator)  # residual = Ax - f
         gradient = adjoint.apply_to(residual, output=gradient)
-        axpby(1.0, x, -step, gradient)
+        axpby(1.0, x, -step, gradient, owner=operator)
         if notify(callback, iteration, x):
             break
     return x
@@ -139,7 +139,7 @@ def conjugate_gradients(
 
     adjoint = operator.T
     residual = operator.apply_to(x, output=zeros(data.shape, like=data))
-    axpby(-1.0, residual, 1.0, data)  # residual = f - Ax
+    axpby(-1.0, residual, 1.0, data, owner=operator)  # residual = f - Ax
     gradient = adjoint.apply_to(residual, output=zeros(x.shape, like=x))
     direction = gradient.copy()
     image = zeros(data.shape, like=data)
@@ -153,13 +153,13 @@ def conjugate_gradients(
             break  # x already solves the normal equations
 
         alpha = gradient_norm_sq / image_norm_sq
-        axpby(1.0, x, alpha, direction)
-        axpby(1.0, residual, -alpha, image)
+        axpby(1.0, x, alpha, direction, owner=operator)
+        axpby(1.0, residual, -alpha, image, owner=operator)
         gradient = adjoint.apply_to(residual, output=gradient)
         new_gradient_norm_sq = X.inner(gradient, gradient)
         beta = new_gradient_norm_sq / gradient_norm_sq
         gradient_norm_sq = new_gradient_norm_sq
-        axpby(beta, direction, 1.0, gradient)
+        axpby(beta, direction, 1.0, gradient, owner=operator)
 
         if notify(callback, iteration, x):
             break

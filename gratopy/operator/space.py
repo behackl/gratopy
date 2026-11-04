@@ -22,6 +22,8 @@ import pyopencl as cl
 import pyopencl.array as clarray
 from pyopencl.reduction import ReductionKernel
 
+from gratopy.operator._program_cache import acquire_leased, owner_leases
+
 
 class Space:
     """Discretized :math:`L^2` space with a diagonal inner-product weighting.
@@ -91,6 +93,7 @@ class Space:
         """Return pickle/deepcopy state without device buffers."""
         state = self.__dict__.copy()
         state["_device_weights"] = {}
+        state.pop("_kernel_leases", None)
         return state
 
     def __eq__(self, other: Any) -> bool:
@@ -174,7 +177,7 @@ class Space:
             stride = prod(x.shape[axis + 1 :])
         queue = x.queue
         assert queue is not None
-        kernel = _weighted_dot_kernel(queue.context, x.dtype)
+        kernel = self._weighted_dot_kernel(queue.context, x.dtype)
         weights = self._weights_on_device(queue, x.dtype)
         result = kernel(
             x,
@@ -198,27 +201,35 @@ class Space:
             self._device_weights[key] = weights
         return weights
 
+    def _weighted_dot_kernel(
+        self, context: cl.Context, dtype: np.dtype
+    ) -> ReductionKernel:
+        """Return a reduction computing ``sum_i x[i] y[i] w[(i / stride) % count]``.
 
-_WEIGHTED_DOT_KERNELS: dict[tuple[cl.Context, np.dtype], ReductionKernel] = {}
+        The kernel is shared through the program cache and leased by this
+        space, so it is released together with the space.
+        """
+        dtype = np.dtype(dtype)
+        ctype = {np.dtype(np.float32): "float", np.dtype(np.float64): "double"}[dtype]
 
+        def build() -> ReductionKernel:
+            return ReductionKernel(
+                context,
+                dtype_out=dtype,
+                neutral="0",
+                reduce_expr="a+b",
+                map_expr="x[i] * y[i] * w[(i / weight_stride) % weight_count]",
+                arguments=(
+                    f"const {ctype} *x, const {ctype} *y, const {ctype} *w, "
+                    "const long weight_stride, const long weight_count"
+                ),
+                name="gratopy_weighted_dot",
+            )
 
-def _weighted_dot_kernel(context: cl.Context, dtype: np.dtype) -> ReductionKernel:
-    """Return a reduction computing ``sum_i x[i] y[i] w[(i / stride) % count]``."""
-    key = (context, np.dtype(dtype))
-    kernel = _WEIGHTED_DOT_KERNELS.get(key)
-    if kernel is None:
-        ctype = {np.dtype(np.float32): "float", np.dtype(np.float64): "double"}[key[1]]
-        kernel = ReductionKernel(
-            context,
-            dtype_out=key[1],
-            neutral="0",
-            reduce_expr="a+b",
-            map_expr="x[i] * y[i] * w[(i / weight_stride) % weight_count]",
-            arguments=(
-                f"const {ctype} *x, const {ctype} *y, const {ctype} *w, "
-                "const long weight_stride, const long weight_count"
-            ),
-            name="gratopy_weighted_dot",
+        bundle = acquire_leased(
+            owner_leases(self),
+            ("weighted_dot", context, dtype),
+            (context, f"gratopy_weighted_dot:{dtype.name}", None),
+            build,
         )
-        _WEIGHTED_DOT_KERNELS[key] = kernel
-    return kernel
+        return bundle.program

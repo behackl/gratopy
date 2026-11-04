@@ -169,6 +169,8 @@ class Operator:
         """Return serializable state without the weak adjoint memoization."""
         state = self.__dict__.copy()
         state["_adjoint_ref"] = None
+        # Leases on compiled OpenCL programs (see gratopy.operator._program_cache).
+        state.pop("_kernel_leases", None)
         return state
 
     @property

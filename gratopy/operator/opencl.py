@@ -16,15 +16,21 @@ import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from threading import RLock, local
-from typing import Any, Callable, Literal
-from weakref import WeakValueDictionary
+from typing import Any, Literal
 
 import numpy as np
 import numpy.typing as npt
 import pyopencl as cl
 import pyopencl.array as clarray
 
+from gratopy.operator._program_cache import (  # noqa: F401 (re-exported)
+    _PROGRAM_CACHE,
+    _ProgramBundle,
+    _ProgramCache,
+    _ProgramCacheKey,
+    _ProgramLeaseKey,
+    acquire_leased,
+)
 from gratopy.operator.base import Operator
 
 
@@ -160,88 +166,6 @@ class OpenCLKernelSpec:
     def signature(self) -> str:
         """Return a content-based signature used for program cacheing."""
         return self.source_snapshot()[1]
-
-
-_ProgramCacheKey = tuple[cl.Context, str, bool]
-_ProgramLeaseKey = tuple[cl.Context, bool]
-
-
-class _ProgramBundle:
-    """Compiled program shared by operators through strong runtime leases."""
-
-    def __init__(
-        self,
-        *,
-        cache_key: _ProgramCacheKey,
-        generation: int,
-        program: cl.Program,
-    ) -> None:
-        self.cache_key = cache_key
-        self.generation = generation
-        self.program = program
-        self._thread_state = local()
-
-    def kernel(self, name: str) -> cl.Kernel:
-        """Return a kernel instance local to the calling thread."""
-        kernels = getattr(self._thread_state, "kernels", None)
-        if kernels is None:
-            kernels = {}
-            self._thread_state.kernels = kernels
-
-        kernel = kernels.get(name)
-        if kernel is None:
-            kernel = cl.Kernel(self.program, name)
-            kernels[name] = kernel
-        return kernel
-
-
-class _ProgramCache:
-    """Weak registry interning compiled OpenCL program bundles."""
-
-    def __init__(self) -> None:
-        self._bundles: WeakValueDictionary[_ProgramCacheKey, _ProgramBundle] = (
-            WeakValueDictionary()
-        )
-        self._generation = 0
-        self._lock = RLock()
-
-    @property
-    def generation(self) -> int:
-        """Return the current invalidation generation."""
-        with self._lock:
-            return self._generation
-
-    def acquire(
-        self,
-        cache_key: _ProgramCacheKey,
-        build: Callable[[], cl.Program],
-    ) -> _ProgramBundle:
-        """Return a shared bundle, compiling it once on a cache miss."""
-        with self._lock:
-            bundle = self._bundles.get(cache_key)
-            if bundle is not None:
-                return bundle
-
-            bundle = _ProgramBundle(
-                cache_key=cache_key,
-                generation=self._generation,
-                program=build(),
-            )
-            self._bundles[cache_key] = bundle
-            return bundle
-
-    def invalidate(self) -> None:
-        """Invalidate all entries while allowing active leases to finish."""
-        with self._lock:
-            self._generation += 1
-            self._bundles.clear()
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._bundles)
-
-
-_PROGRAM_CACHE = _ProgramCache()
 
 
 class _OpenCLOperator(Operator):
@@ -384,13 +308,6 @@ class _OpenCLOperator(Operator):
         sources, signature = self.kernel_spec.source_snapshot()
         cache_key = (context, signature, two_orders)
         lease_key = (context, two_orders)
-        bundle = self._program_bundles.get(lease_key)
-        if (
-            bundle is not None
-            and bundle.cache_key == cache_key
-            and bundle.generation == _PROGRAM_CACHE.generation
-        ):
-            return bundle
 
         def build() -> cl.Program:
             code = self._build_code(
@@ -402,9 +319,7 @@ class _OpenCLOperator(Operator):
             program.build(options=list(self.kernel_spec.build_options))
             return program
 
-        bundle = _PROGRAM_CACHE.acquire(cache_key, build)
-        self._program_bundles[lease_key] = bundle
-        return bundle
+        return acquire_leased(self._program_bundles, lease_key, cache_key, build)
 
     def _kernel_name(
         self,

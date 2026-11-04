@@ -10,7 +10,12 @@ import pyopencl as cl
 import pyopencl.array as clarray
 
 from gratopy.operator.base import Operator
-from gratopy.operator.opencl import _expand_gratopy_template
+from gratopy.operator._program_cache import (
+    _ProgramBundle,
+    acquire_leased,
+    owner_leases,
+)
+from gratopy.operator.opencl import OpenCLKernelSpec, _expand_gratopy_template
 from gratopy.reconstruction._common import (
     Callback,
     check_iterations,
@@ -23,8 +28,10 @@ from gratopy.reconstruction._common import (
 )
 from gratopy.reconstruction._vector import axpby, order_of, zeros
 
-_KERNEL_PATH = Path(__file__).resolve().parent.parent / "total_variation.cl"
-_PROGRAMS: dict[cl.Context, cl.Program] = {}
+_KERNEL_SPEC = OpenCLKernelSpec.from_path(
+    Path(__file__).resolve().parent.parent / "total_variation.cl",
+    base_name="total_variation",
+)
 
 # Squared norm bound of the 3D gradient (12) plus the normalized operator (1).
 _STACKED_NORM_SQ = 13
@@ -115,7 +122,7 @@ def total_variation(
     norm = resolve_operator_norm(operator, operator_norm, data)
 
     assert data.queue is not None
-    kernels = _Kernels(data.queue.context, data.dtype, order_of(data))
+    kernels = _Kernels(operator, data.queue.context, data.dtype, order_of(data))
     adjoint = operator.T
 
     u = zeros(image_shape, like=data)
@@ -147,7 +154,7 @@ def total_variation(
         )
 
         # Extrapolation: u <- 2 u_new - u_old; then swap roles
-        axpby(-1.0, u, 2.0, u_extrapolated)
+        axpby(-1.0, u, 2.0, u_extrapolated, owner=operator)
         u, u_extrapolated = u_extrapolated, u
 
         if notify(callback, iteration, u):
@@ -167,34 +174,48 @@ def _pixel_size(operator: Operator) -> float:
     return float(np.sqrt(domain.scale))
 
 
-def _program(context: cl.Context) -> cl.Program:
-    program = _PROGRAMS.get(context)
-    if program is None:
+def _program(owner: Any, context: cl.Context) -> _ProgramBundle:
+    """Return the TV program for ``context``, leased by ``owner``.
+
+    ``owner`` is the operator passed to :func:`total_variation`: the program is
+    compiled once per operator and context and released with the operator.
+    """
+    sources, signature = _KERNEL_SPEC.source_snapshot()
+
+    def build() -> cl.Program:
         dtypes = ["float"]
         if any(device.double_fp_config for device in context.devices):
             dtypes.append("double")
-        source = _expand_gratopy_template(
-            _KERNEL_PATH.read_text(), dtypes=dtypes, two_orders=False
+        source = "".join(
+            _expand_gratopy_template(text, dtypes=dtypes, two_orders=False)
+            for text in sources
         )
-        program = cl.Program(context, source).build()
-        _PROGRAMS[context] = program
-    return program
+        return cl.Program(context, source).build()
+
+    return acquire_leased(
+        owner_leases(owner),
+        ("total_variation", context),
+        (context, signature, False),
+        build,
+    )
 
 
 class _Kernels:
     """The fused primal-dual update kernels of ``total_variation.cl``."""
 
-    def __init__(self, context: cl.Context, dtype: np.dtype, order: str) -> None:
+    def __init__(
+        self, owner: Any, context: cl.Context, dtype: np.dtype, order: str
+    ) -> None:
         if np.dtype(dtype) == np.dtype(np.float64) and not any(
             device.double_fp_config for device in context.devices
         ):
             raise TypeError("The OpenCL device does not support double precision.")
-        program = _program(context)
+        program = _program(owner, context)
         suffix = f"{'float' if dtype == np.float32 else 'double'}_{order.lower()}"
-        self._update_v = cl.Kernel(program, f"update_v_{suffix}")
-        self._project_v = cl.Kernel(program, f"update_NormV_unchor_{suffix}")
-        self._update_lambda = cl.Kernel(program, f"update_lambda_L2_{suffix}")
-        self._update_u = cl.Kernel(program, f"update_u_{suffix}")
+        self._update_v = program.kernel(f"update_v_{suffix}")
+        self._project_v = program.kernel(f"update_NormV_unchor_{suffix}")
+        self._update_lambda = program.kernel(f"update_lambda_L2_{suffix}")
+        self._update_u = program.kernel(f"update_u_{suffix}")
 
     @staticmethod
     def _run(kernel, shape, output, *arguments, inputs=()):
