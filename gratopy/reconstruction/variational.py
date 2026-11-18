@@ -20,6 +20,7 @@ from gratopy.reconstruction._common import (
     Callback,
     check_iterations,
     check_positive,
+    kernel_owner,
     notify,
     prepare_data,
     resolve_operator_norm,
@@ -115,7 +116,8 @@ def total_variation(
     norm = resolve_operator_norm(operator, operator_norm, data)
 
     assert data.queue is not None
-    kernels = _Kernels(operator, data.queue.context, data.dtype, order_of(data))
+    owner = kernel_owner(operator)
+    kernels = _Kernels(owner, data.queue.context, data.dtype, order_of(data))
     adjoint = operator.T
 
     u = zeros(image_shape, like=data)
@@ -147,7 +149,7 @@ def total_variation(
         )
 
         # Extrapolation: u <- 2 u_new - u_old; then swap roles
-        axpby(-1.0, u, 2.0, u_extrapolated, owner=operator)
+        axpby(-1.0, u, 2.0, u_extrapolated, owner=owner)
         u, u_extrapolated = u_extrapolated, u
 
         if notify(callback, iteration, u):
@@ -169,8 +171,8 @@ def _pixel_size(operator: Operator) -> float:
 def _program(owner: Any, context: cl.Context) -> _ProgramBundle:
     """Return the TV program for ``context``, leased by ``owner``.
 
-    ``owner`` is the operator passed to :func:`total_variation`: the program is
-    compiled once per operator and context and released with the operator.
+    ``owner`` is given by :func:`kernel_owner`: the program is compiled once per
+    owner and context and released with the owner.
     """
     sources, signature = _KERNEL_SPEC.source_snapshot()
 

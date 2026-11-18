@@ -12,6 +12,7 @@ from gratopy.reconstruction._common import (
     check_iterations,
     check_positive,
     initial_guess,
+    kernel_owner,
     notify,
     prepare_data,
     resolve_operator_norm,
@@ -60,15 +61,16 @@ def landweber(
     resolve_spaces(operator)  # reject expressions with ambiguous adjoints
     x = initial_guess(operator, data, x0)
     step = w / resolve_operator_norm(operator, operator_norm, data) ** 2
+    owner = kernel_owner(operator)
 
     adjoint = operator.T
     residual = zeros(data.shape, like=data)
     gradient = zeros(x.shape, like=x)
     for iteration in range(1, number_iterations + 1):
         residual = operator.apply_to(x, output=residual)
-        axpby(1.0, residual, -1.0, data, owner=operator)  # residual = Ax - f
+        axpby(1.0, residual, -1.0, data, owner=owner)  # residual = Ax - f
         gradient = adjoint.apply_to(residual, output=gradient)
-        axpby(1.0, x, -step, gradient, owner=operator)
+        axpby(1.0, x, -step, gradient, owner=owner)
         if notify(callback, iteration, x):
             break
     return x
@@ -119,8 +121,9 @@ def conjugate_gradients(
     x = initial_guess(operator, data, x0)
 
     adjoint = operator.T
+    owner = kernel_owner(operator)
     residual = operator.apply_to(x, output=zeros(data.shape, like=data))
-    axpby(-1.0, residual, 1.0, data, owner=operator)  # residual = f - Ax
+    axpby(-1.0, residual, 1.0, data, owner=owner)  # residual = f - Ax
     gradient = adjoint.apply_to(residual, output=zeros(x.shape, like=x))
     direction = gradient.copy()
     image = zeros(data.shape, like=data)
@@ -134,13 +137,13 @@ def conjugate_gradients(
             break  # x already solves the normal equations
 
         alpha = gradient_norm_sq / image_norm_sq
-        axpby(1.0, x, alpha, direction, owner=operator)
-        axpby(1.0, residual, -alpha, image, owner=operator)
+        axpby(1.0, x, alpha, direction, owner=owner)
+        axpby(1.0, residual, -alpha, image, owner=owner)
         gradient = adjoint.apply_to(residual, output=gradient)
         new_gradient_norm_sq = X.inner(gradient, gradient)
         beta = new_gradient_norm_sq / gradient_norm_sq
         gradient_norm_sq = new_gradient_norm_sq
-        axpby(beta, direction, 1.0, gradient, owner=operator)
+        axpby(beta, direction, 1.0, gradient, owner=owner)
 
         if notify(callback, iteration, x):
             break

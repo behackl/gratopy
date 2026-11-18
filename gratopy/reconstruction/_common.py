@@ -10,7 +10,7 @@ import numpy as np
 import pyopencl as cl
 import pyopencl.array as clarray
 
-from gratopy.operator.base import Operator
+from gratopy.operator.base import Operator, _leaf_operators
 from gratopy.reconstruction._vector import order_of, zeros
 
 Callback = Callable[[int, Any], "bool | None"]
@@ -133,6 +133,17 @@ def resolve_operator_norm(
         queue = data.queue if isinstance(data, clarray.Array) else None
         operator_norm = operator.norm_estimate(dtype=data.dtype, queue=queue)
     return check_positive(operator_norm, "operator_norm")
+
+
+def kernel_owner(operator: Operator) -> Any:
+    """Return the object that leases the solver kernels for ``operator``.
+
+    Solver kernels are released together with their owner. Using the first
+    leaf operator rather than ``operator`` itself keeps them alive across
+    calls with temporary expressions such as ``2 * R``.
+    """
+    leaves = _leaf_operators(operator)
+    return leaves[0] if leaves else operator
 
 
 def notify(callback: Callback | None, iteration: int, x: Any) -> bool:

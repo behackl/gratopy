@@ -23,11 +23,9 @@ import numpy.typing as npt
 import pyopencl as cl
 import pyopencl.array as clarray
 
-from gratopy.operator._program_cache import (  # noqa: F401 (re-exported)
+from gratopy.operator._program_cache import (
     _PROGRAM_CACHE,
     _ProgramBundle,
-    _ProgramCache,
-    _ProgramCacheKey,
     _ProgramLeaseKey,
     acquire_leased,
 )

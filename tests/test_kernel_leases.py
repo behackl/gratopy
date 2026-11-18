@@ -96,3 +96,22 @@ def queue_and_operator(device):
     R = Radon(image_domain=8, angles=6)
     data = clarray.zeros(queue, R.output_shape, np.float32)
     return queue, R, data
+
+
+def test_temporary_expressions_reuse_the_programs(queue_and_operator, monkeypatch):
+    queue, R, data = queue_and_operator
+    builds = []
+    acquire = type(_PROGRAM_CACHE).acquire
+
+    def counting_acquire(self, cache_key, build):
+        def counted_build():
+            builds.append(cache_key)
+            return build()
+
+        return acquire(self, cache_key, counted_build)
+
+    monkeypatch.setattr(type(_PROGRAM_CACHE), "acquire", counting_acquire)
+    for _ in range(3):
+        total_variation(2.0 * R, data, mu=1.0, number_iterations=1, operator_norm=1.0)
+        conjugate_gradients(2.0 * R, data, 1)
+    assert len(builds) == len(set(builds))  # each program compiled at most once
