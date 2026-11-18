@@ -76,50 +76,31 @@ def _validate_product_spaces(operands: Sequence[Operator]) -> None:
         )
 
 
-def _to_host(array: Any) -> np.ndarray:
-    """Return a NumPy copy of a NumPy or device (e.g. pyopencl) array."""
-    if isinstance(array, np.ndarray):
+def _random_like(
+    rng: np.random.Generator,
+    shape: tuple[int, ...],
+    dtype: npt.DTypeLike,
+    queue: Any | None,
+) -> Any:
+    """Return a random NumPy array, or a pyopencl array if a queue is given."""
+    array = rng.standard_normal(shape).astype(dtype)
+    if queue is None:
         return array
-    get = getattr(array, "get", None)
-    return np.asarray(get() if callable(get) else array)
+    import pyopencl.array as clarray  # only needed for device operators
+
+    return clarray.to_device(queue, array)
 
 
-def _adjoint_mismatch(
-    lhs: float,
-    rhs: float,
-    ax_norm: float,
-    y_norm: float,
-    x_norm: float,
-    aty_norm: float,
-) -> float:
-    """Return the relative mismatch of the adjoint test.
-
-    ``lhs`` is :math:`\\langle Ax, y\\rangle_Y`, ``rhs`` is
-    :math:`\\langle x, A^* y\\rangle_X`; the result is
-    :math:`|\\mathrm{lhs} - \\mathrm{rhs}| / \\max(|\\mathrm{lhs}|, |\\mathrm{rhs}|)`.
-    The norms of the four vectors are passed for alternative normalizations
-    and diagnostics.
-    """
+def _adjoint_mismatch(lhs: float, rhs: float) -> float:
+    """Return ``|lhs - rhs| / max(|lhs|, |rhs|)`` (0 if both vanish)."""
     # Normalizing by the larger of the two values makes a wrong adjoint show
     # up as an O(1) mismatch independently of the problem size (normalizing by
     # the Cauchy-Schwarz bound would shrink it like 1/sqrt(size)). The price is
-    # a heavier tail when lhs happens to be close to 0 for the random x, y, so
-    # the tolerance must not be too tight.
+    # a heavier tail when lhs happens to be close to 0 for the random x, y.
     scale = max(abs(lhs), abs(rhs))
     if scale == 0:
-        return 0.0  # both sides agree (e.g. A = 0)
+        return 0.0
     return abs(lhs - rhs) / scale
-
-
-def _default_adjoint_rtol(dtype: np.dtype) -> float:
-    """Return the tolerance on :func:`_adjoint_mismatch` for ``dtype``."""
-    # Wrong weightings give mismatches of about 1. Correct float32 adjoints
-    # stay around 1e-5 but have a tail (random lhs close to 0) that grows with
-    # the problem size; 1e-2 leaves room for it. Complex dtypes use the
-    # precision of their real part.
-    if np.finfo(dtype).dtype.itemsize >= 8:
-        return 1e-8
-    return 1e-2
 
 
 def _scalar_repr(scalar: Numeric) -> str:
@@ -138,11 +119,6 @@ def _with_return_event(result: Any, return_event: bool) -> Any:
 class Operator:
     """Base class for operators and operator expression nodes."""
 
-    #: Whether :attr:`T` is known to be the adjoint in the default spaces, so
-    #: that :meth:`ensure_adjoint` can skip the numerical test. Set by
-    #: gratopy's own leaf operators; expression nodes derive it from their
-    #: operands.
-    _adjoint_trusted: bool = False
     # Whether ``domain`` and ``codomain`` may be assigned. Expression nodes and
     # projection operators derive their spaces and disallow assignment.
     _spaces_assignable = True
@@ -163,8 +139,6 @@ class Operator:
         self._domain = self._checked_space(domain, input_shape, "domain")
         self._codomain = self._checked_space(codomain, output_shape, "codomain")
         self._adjoint_ref: ReferenceType[AdjointOperator] | None = None
-        # (domain, codomain, dtype) combinations in which T passed the test.
-        self._adjoint_verified: set[tuple[Any, Any, np.dtype]] = set()
 
     def __getstate__(self) -> dict[str, Any]:
         """Return serializable state without the weak adjoint memoization."""
@@ -235,113 +209,42 @@ class Operator:
         """Return the codomain implied by the operator's structure."""
         return None
 
-    def _is_adjoint_trusted(self) -> bool:
-        """Return whether :attr:`T` is the adjoint without a numerical test.
-
-        Explicitly set spaces are never trusted: the setters change the inner
-        products but not what :attr:`T` computes.
-        """
-        return self._adjoint_trusted and self._domain is None and self._codomain is None
-
-    def _adjoint_key(self, dtype: npt.DTypeLike) -> tuple[Any, Any, np.dtype]:
-        return (self.domain, self.codomain, np.dtype(dtype))
-
-    def mark_adjoint_verified(self, dtype: npt.DTypeLike = np.float32) -> None:
-        """Declare :attr:`T` the adjoint in the current spaces for ``dtype``.
-
-        This skips :meth:`ensure_adjoint` (e.g., for an operator whose adjoint
-        is knowingly approximate). Changing :attr:`domain` or :attr:`codomain`
-        afterwards revokes it.
-        """
-        self._adjoint_verified.add(self._adjoint_key(dtype))
-
     def check_adjoint(
         self,
         dtype: npt.DTypeLike = np.float32,
-        input_shape: tuple[int, ...] | None = None,
         queue: Any | None = None,
         rng: np.random.Generator | None = None,
-        adjoint: Operator | None = None,
-        **kwargs: Any,
     ) -> float:
-        """Return the relative mismatch of the randomized adjoint test.
+        """Test numerically whether :attr:`T` is the adjoint in the operator's spaces.
 
-        Compares :math:`\\langle Ax, y\\rangle_Y` with
-        :math:`\\langle x, A^* y\\rangle_X` for random ``x`` and ``y``, where
-        :math:`A^*` is :attr:`T` and the inner products are those of
-        :attr:`domain` and :attr:`codomain` (Euclidean if unspecified). This
-        costs one application of the operator and one of its adjoint.
+        Compares :math:`\\langle Ax, y\\rangle` with
+        :math:`\\langle x, A^* y\\rangle` for random ``x`` and ``y``, taking
+        the inner products in :attr:`domain` and :attr:`codomain` (see
+        :func:`resolve_spaces`), and returns the relative mismatch. Correct
+        adjoints give values at the level of the rounding errors (around
+        :math:`10^{-5}` in single precision); a wrong adjoint, e.g., one that
+        ignores the weights of a space, gives values of order 1. This costs one
+        application of the operator and one of its adjoint.
 
-        A mismatch of order 1 means :attr:`T` is not the adjoint in these
-        spaces, e.g., because a weighting is missing or a space was changed
-        with the :attr:`domain`/:attr:`codomain` setters.
+        :param dtype: Data type of the random test vectors.
+        :param queue: If given, the test vectors are pyopencl arrays on this
+            queue, otherwise NumPy arrays.
+        :param rng: Random-number generator for the test vectors; a fixed seed
+            is used by default, so the result is deterministic.
+        :return: :math:`|\\langle Ax, y\\rangle - \\langle x, A^* y\\rangle|`
+            divided by the larger of the two absolute values.
         """
-        if input_shape is None:
-            input_shape = self.input_shape
-        if input_shape is None:
-            raise ValueError(
-                "Cannot check the adjoint without an input shape. Set "
-                "operator.input_shape or pass input_shape explicitly."
-            )
+        X, Y = resolve_spaces(self)
+        assert self.input_shape is not None
         if rng is None:
-            # Fixed seed: deterministic, and the caller's rng is not consumed.
             rng = np.random.default_rng(0)
-        if adjoint is None:
-            adjoint = self.T
-        if queue is not None:
-            kwargs["queue"] = queue
+        options = {} if queue is None else {"queue": queue}
 
-        dtype = np.dtype(dtype)
-        x = np.asarray(rng.standard_normal(input_shape), dtype=dtype)
-        ax = _to_host(self.apply_to(x, **kwargs))
-        y = np.asarray(rng.standard_normal(ax.shape), dtype=dtype)
-        aty = _to_host(adjoint.apply_to(y, **kwargs))
-
-        X = self.domain if self.domain is not None else Space(tuple(input_shape))
-        Y = self.codomain if self.codomain is not None else Space(ax.shape)
-        # Space.inner is bilinear; conjugating the second argument gives the
-        # (real part of the) Hermitian inner product for complex operators.
-        lhs = Y.inner(ax, np.conj(y))
-        rhs = X.inner(x, np.conj(aty))
-        return _adjoint_mismatch(
-            lhs, rhs, Y.norm(np.abs(ax)), Y.norm(y), X.norm(x), X.norm(np.abs(aty))
-        )
-
-    def ensure_adjoint(
-        self,
-        dtype: npt.DTypeLike = np.float32,
-        input_shape: tuple[int, ...] | None = None,
-        queue: Any | None = None,
-        rtol: float | None = None,
-        adjoint: Operator | None = None,
-        **kwargs: Any,
-    ) -> None:
-        """Raise if :attr:`T` is not the adjoint in :attr:`domain`/:attr:`codomain`.
-
-        Operators built only from gratopy's projection operators,
-        ``IDENTITY`` and ``ZERO`` are skipped. Otherwise :meth:`check_adjoint`
-        runs once per combination of spaces and dtype; the result is cached,
-        and changing a space triggers a new test.
-        """
-        if self._is_adjoint_trusted():
-            return
-        key = self._adjoint_key(dtype)
-        if key in self._adjoint_verified:
-            return
-
-        mismatch = self.check_adjoint(
-            dtype=dtype, input_shape=input_shape, queue=queue, adjoint=adjoint, **kwargs
-        )
-        tolerance = _default_adjoint_rtol(np.dtype(dtype)) if rtol is None else rtol
-        if not mismatch <= tolerance:
-            raise ValueError(
-                f"{self}.T is not the adjoint with respect to domain "
-                f"{self.domain} and codomain {self.codomain} (relative mismatch "
-                f"{mismatch:.1e}, tolerance {tolerance:.1e}; unspecified spaces "
-                "are Euclidean). Declare the spaces T is adjoint in, or skip "
-                "the test with check_adjoint=False or mark_adjoint_verified()."
-            )
-        self._adjoint_verified.add(key)
+        x = _random_like(rng, self.input_shape, dtype, queue)
+        ax = self.apply_to(x, **options)
+        y = _random_like(rng, ax.shape, dtype, getattr(ax, "queue", None))
+        aty = self.T.apply_to(y, **options)
+        return _adjoint_mismatch(Y.inner(ax, y), X.inner(x, aty))
 
     def _repr_name_(self) -> str:
         """Return the operator name used in string representations."""
@@ -384,8 +287,6 @@ class Operator:
         algorithm: Literal["poweriteration", "naive"] = "poweriteration",
         queue: Any | None = None,
         rng: np.random.Generator | None = None,
-        check_adjoint: bool = True,
-        adjoint_rtol: float | None = None,
         **kwargs: Any,
     ) -> float:
         """Estimate the operator norm.
@@ -412,14 +313,6 @@ class Operator:
             Optional backend-specific execution queue forwarded to applications.
         rng:
             Random-number generator used to construct the starting vector.
-        check_adjoint:
-            Before power iteration, verify via :meth:`ensure_adjoint` that
-            :attr:`T` is the adjoint in the operator's spaces (once per
-            operator, spaces and dtype; skipped for gratopy's own operators).
-            Raises :class:`ValueError` if not.
-        adjoint_rtol:
-            Tolerance of that check; defaults to ``1e-2`` for single and
-            ``1e-8`` for double precision.
         """
         if algorithm not in {"poweriteration", "naive"}:
             raise ValueError(
@@ -443,8 +336,6 @@ class Operator:
                 dtype=dtype,
                 queue=queue,
                 rng=rng,
-                check_adjoint=check_adjoint,
-                adjoint_rtol=adjoint_rtol,
                 **kwargs,
             )
             if naive_norm is not None:
@@ -456,8 +347,6 @@ class Operator:
             input_shape=input_shape,
             queue=queue,
             rng=rng,
-            check_adjoint=check_adjoint,
-            adjoint_rtol=adjoint_rtol,
             **kwargs,
         )
 
@@ -476,8 +365,6 @@ class Operator:
         input_shape: tuple[int, ...] | None,
         queue: Any | None,
         rng: np.random.Generator | None,
-        check_adjoint: bool = True,
-        adjoint_rtol: float | None = None,
         **kwargs: Any,
     ) -> float:
         if input_shape is None:
@@ -488,19 +375,7 @@ class Operator:
                 "operator.input_shape or pass input_shape explicitly."
             )
 
-        if input_shape == self.input_shape:
-            resolve_spaces(self)  # reject expressions with ambiguous adjoints
         adjoint = self.T
-        if check_adjoint:
-            self.ensure_adjoint(
-                dtype=dtype,
-                input_shape=tuple(input_shape),
-                queue=queue,
-                rtol=adjoint_rtol,
-                adjoint=adjoint,
-                **kwargs,
-            )
-
         if rng is None:
             rng = np.random.default_rng()
 
@@ -632,13 +507,6 @@ class AdjointOperator(Operator):
     def _default_codomain(self) -> Space | None:
         return self.operand.domain
 
-    def _is_adjoint_trusted(self) -> bool:
-        return (
-            self._domain is None
-            and self._codomain is None
-            and self.operand._is_adjoint_trusted()
-        )
-
     @property
     def T(self) -> Operator:
         """The adjoint of an adjoint is the underlying operator."""
@@ -694,13 +562,6 @@ class ScaledOperator(Operator):
 
     def _default_codomain(self) -> Space | None:
         return self.operand.codomain
-
-    def _is_adjoint_trusted(self) -> bool:
-        return (
-            self._domain is None
-            and self._codomain is None
-            and self.operand._is_adjoint_trusted()
-        )
 
     @classmethod
     def create(cls, scalar: Numeric, operand: Operator) -> Operator:
@@ -786,13 +647,6 @@ class SumOperator(Operator):
     def _default_codomain(self) -> Space | None:
         return _common_space([op.codomain for op in self.operands], "Codomain in sum")
 
-    def _is_adjoint_trusted(self) -> bool:
-        return (
-            self._domain is None
-            and self._codomain is None
-            and all(op._is_adjoint_trusted() for op in self.operands)
-        )
-
     @classmethod
     def create(cls, *operators: Operator) -> Operator:
         operands: list[Operator] = []
@@ -874,13 +728,6 @@ class CompositionOperator(Operator):
     def _default_codomain(self) -> Space | None:
         return self.operands[0].codomain
 
-    def _is_adjoint_trusted(self) -> bool:
-        return (
-            self._domain is None
-            and self._codomain is None
-            and all(op._is_adjoint_trusted() for op in self.operands)
-        )
-
     @classmethod
     def create(cls, *operators: Operator) -> Operator:
         operands: list[Operator] = []
@@ -945,8 +792,6 @@ class CompositionOperator(Operator):
 class _IdentityOperator(Operator):
     """Shape-agnostic identity operator."""
 
-    # Self-adjoint with respect to every inner product.
-    _adjoint_trusted = True
     _spaces_assignable = False
 
     @property
@@ -972,8 +817,6 @@ class _IdentityOperator(Operator):
 class _ZeroOperator(Operator):
     """Shape-agnostic zero operator."""
 
-    # Self-adjoint with respect to every inner product.
-    _adjoint_trusted = True
     _spaces_assignable = False
 
     @property

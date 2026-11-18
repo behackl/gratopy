@@ -76,9 +76,6 @@ class _ProjectionOperator(_OpenCLOperator):
     _kernel_filename = ""
     _kernel_base_name = ""
     _device_array_specs: tuple[tuple[str, str], ...] = ()
-    # The kernels implement the adjoint in the spaces of _projection_spaces;
-    # this is verified by the test suite rather than at runtime.
-    _adjoint_trusted = True
 
     def __init__(
         self,

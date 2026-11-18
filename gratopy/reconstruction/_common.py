@@ -131,28 +131,8 @@ def resolve_operator_norm(
     """Return the given operator norm or estimate it once."""
     if operator_norm is None:
         queue = data.queue if isinstance(data, clarray.Array) else None
-        # The adjoint was already handled by verify_adjoint.
-        operator_norm = operator.norm_estimate(
-            dtype=data.dtype, queue=queue, check_adjoint=False
-        )
+        operator_norm = operator.norm_estimate(dtype=data.dtype, queue=queue)
     return check_positive(operator_norm, "operator_norm")
-
-
-def verify_adjoint(
-    operator: Operator,
-    data: Any,
-    check_adjoint: bool,
-    rtol: float | None = None,
-) -> None:
-    """Raise if ``operator.T`` is not the adjoint in the operator's spaces.
-
-    Runs :meth:`~gratopy.operator.Operator.ensure_adjoint`, which is cached
-    and skipped for gratopy's own operators.
-    """
-    if not check_adjoint:
-        return
-    queue = data.queue if isinstance(data, clarray.Array) else None
-    operator.ensure_adjoint(dtype=data.dtype, queue=queue, rtol=rtol)
 
 
 def notify(callback: Callback | None, iteration: int, x: Any) -> bool:

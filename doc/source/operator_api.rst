@@ -360,6 +360,15 @@ declared spaces are rejected with a :class:`ValueError` naming the operator to
 fix, as their adjoint would otherwise silently refer to the wrong inner
 product.
 
+To test a custom operator, :meth:`~gratopy.operator.base.Operator.check_adjoint`
+compares :math:`\langle Ax, y\rangle` with :math:`\langle x, A^* y\rangle` in
+these spaces for random ``x`` and ``y``. Correct adjoints give mismatches at the
+level of rounding errors, while a missing weighting gives a mismatch of order 1:
+
+.. code-block:: python
+
+    (R * S).check_adjoint(queue=queue)    # e.g. 1e-05
+
 Reconstruction
 --------------
 
